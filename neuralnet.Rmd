@@ -1,0 +1,367 @@
+---
+title: "a1"
+author: "Kelly-Robyn Singh"
+date: "2023-10-23"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, eval = FALSE)
+```
+
+```{r Loading Libraries}
+library(glmnet)
+library(reticulate)
+library(tensorflow)
+library(tensorflow)
+library(keras)
+library(tidyverse)
+library(stringr)
+library(lubridate)
+library(tidytext)
+library(rpart) 
+library(keras)
+library(dplyr)
+library(tidytext)
+library(tm)
+library(rpart.plot)
+library(knitr)
+library(kableExtra)
+library(caret)
+```
+
+```{r Defining Stop Words}
+# removed stop words 
+replace_reg <- "(http.*?(\\s|.$))|(www.*?(\\s|.$))|&amp;|&lt;|&gt;"
+#rnum <- "\\d+"
+unnest_reg <- "[^\\w_#@']"
+```
+
+```{r Reading in Data}
+
+set.seed(11)
+# set as tibble
+sona <- as_tibble(sona)
+sona <- sona %>% mutate(speech = str_replace(speech, "\\d{1,2} [A-Za-z]+ \\d{4}", "")) # Remove dates at the start of the speech
+# clean dates 
+sona <- sona %>% mutate(speech = str_replace(speech, pattern = "^Thursday, ", replacement = ""))# remove dates on 2 remaining Ramaphosa speeches 
+# rm white space
+sona <- sona %>% mutate(speech = str_trim(speech, side = "left")) %>%
+  mutate(filename = sub("\\.txt$", "", filename))  %>%
+  filter(!(president_13 %in% c("Motlanthe", "deKlerk")))
+```
+
+
+```{r Tokenization}
+# tokenize by sentence then by word then join so each row is a sentence 
+sona_tokens <- unnest_tokens(sona, sentence, speech, token = 'sentences') 
+sona_tokens <- sona_tokens %>% mutate(sentence = str_replace_all(sentence, "[[:punct:]]", "")) %>%
+                   mutate(ID = row_number()) %>%
+                   mutate(president_13 = as.factor(president_13))
+
+# create wordbag 
+word_bag <- sona_tokens %>% 
+            unnest_tokens(input = sentence, output = word, token = 'words') %>%
+            group_by(ID, president_13, word) %>% 
+            summarise("count" = n()) %>% filter(!word %in% stop_words$word) %>%
+            top_n(200)
+
+```
+
+```{r Bag of Words}
+sona_tdf <- sona_tokens %>%
+  unnest_tokens(input = sentence, output = word, token = 'words') %>%
+  inner_join(word_bag) %>%
+  group_by(ID, president_13, word) %>%
+  count() %>%  
+  group_by(president_13) %>%
+  mutate(total = sum(n)) %>%
+  ungroup()
+
+# bag of words
+bag_of_words <- sona_tdf %>% 
+  select(ID, president_13, word, n) %>% 
+  pivot_wider(names_from = word, values_from = n, values_fill = 0) %>%
+  mutate(president_13 = as.factor(president_13))
+
+levels(bag_of_words$president_13)
+```
+
+```{r Train And Test}
+set.seed(11)
+# split data into train and test, sample proportionally for all columns 
+test_sona <- sona_tokens %>%
+  group_by(president_13) %>%
+  slice_sample(prop = 0.3) %>%
+  ungroup()
+
+# train data
+train_sona <- anti_join(sona_tokens, test_sona, by = c( "president_13", "ID"))
+
+#for bag of words 
+set.seed(11)
+
+# bag of words test
+test_bow <- bag_of_words %>%
+  semi_join(test_sona, by = "ID") %>% 
+  select(-ID)
+
+test_bow_x <- test_bow %>% select(-president_13) 
+test_bow_y <- test_bow$president_13
+
+# bag of words train
+train_bow <- bag_of_words %>%
+  semi_join(train_sona, by = "ID") %>%
+  select(-ID)
+
+train_bow_x <- train_bow %>% select(-president_13) 
+train_bow_y <- train_bow$president_13
+
+train_bow_x <- as.matrix(train_bow_x)
+test_bow_x <- as.matrix(test_bow_x)
+
+class(train_bow_x)
+class(train_bow_y)
+```
+
+```{r}
+
+save.image("Clean_Data.RData")
+``` 
+
+```{r}
+# model# Define a range of 'cp' values
+# SEARCH 
+
+model_tree_bow <- rpart(president_13 ~ ., method = "class",data = train_bow,
+             control = rpart.control(cp = 0, minsplit = 5, minbucket = 1, maxcompete = 0, maxsurrogate = 0, xval = 0),
+             parms = list(split = "gini"))
+
+# Plot the model
+rpart.plot(model_tree_bow)
+
+
+
+
+as.factor(train_bow$president_13)
+tree_mod <- train(president_13 ~ ., data = train_bow, type = "class", cp= 0.01)
+save(tree_mod, file = "tree_mod.RData")
+load("tree_mod.RData")
+```
+
+```{r}
+#predict class test 
+
+tree_pred <- predict(tree_mod, newdata = test_bow, type = "class")
+library(caret)
+#cm
+tree_mod_cm <- confusionMatrix(tree_pred, test_bow$president_13)
+
+save.image("randomforrests.RData")
+```
+
+
+```{r}
+# model 
+numerical_target <- factor(train_bow_y)
+train_bow_y <- as.numeric(numerical_target) -1
+train_bow_y <- to_categorical(train_bow_y, dtype = "float32")
+
+
+numerical_target_test <- factor(test_bow_y)
+test_bow_y <- as.numeric(numerical_target_test) -1
+unique(test_bow_y)
+test_bow_y <- to_categorical(test_bow_y, dtype = "float32")
+```
+
+
+```{r}
+# feed forward neural network
+model_ffnn <- keras_model_sequential() %>%
+  layer_dense(units = 32, activation = "relu", input_shape = ncol(train_bow_x)) %>%
+  layer_dense(units = 32, activation = "relu", input_shape = ncol(train_bow_x), kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dense(units = 10, activation = "tanh") %>%
+  layer_dense(units = 15 , activation = "relu")%>%
+  layer_dense(units = 32 , activation = "relu")%>%
+  layer_dense(units = 32 , activation = "relu")%>%
+  layer_dense(units = 35, activation = "relu", input_shape = ncol(train_bow_x), kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dense(units = 4, activation = "softmax")
+summary(model_ffnn)
+
+```
+
+```{r}
+# compile model
+model_ffnn %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  metrics = c("accuracy")
+)
+
+```
+
+```{r}
+# fit model
+nn_mod1 <- model_ffnn %>% fit(train_bow_x, train_bow_y, epochs = 10, batch_size = 15, validation_split = 0.1)
+
+plot(nn_mod1)
+```
+
+```{r}
+results <- model_ffnn %>% evaluate(test_bow_x, test_bow_y, batch_size = 15, verbose=2)
+```
+
+```{r}
+
+###tf-idf
+ndocs <- length(unique(sona_tdf$ID))
+
+idf <- sona_tdf %>%
+  group_by(word) %>%
+  summarise(docs_with_word = n()) %>%
+  ungroup() %>%
+  mutate(idf = log(ndocs/docs_with_word)) %>% arrange(desc(idf))
+
+sona_tdf <- sona_tdf %>%
+  left_join(idf, by = "word") %>%
+  mutate(tf = n/total, tf_idf = tf*idf)
+
+
+rando <- sample(sona_tdf$ID, 1)
+sona_tokens %>% filter(ID == rando) %>% select(sentence)
+
+
+sona_tdf %>% filter(ID == rando) %>% arrange(desc(n)) 
+
+tfidf <- sona_tdf %>% 
+  select(ID, word,president_13, tf_idf) %>% 
+  pivot_wider(names_from = word, values_from = tf_idf, values_fill = 0) %>%
+  left_join(sona_tokens %>% select(ID, president_13))
+```
+
+```{r}
+# split data into train and test, sample proportionally for all columns
+test_sona <- sona_tokens %>%
+  group_by(president_13) %>%
+  slice_sample(prop = 0.3) %>%
+  ungroup()
+
+# train data
+train_sona <- anti_join(sona_tokens, test_sona, by = c( "president_13", "ID"))
+
+#for bag of words 
+set.seed(11)
+
+# bag of words test
+test_tfidf <- tfidf %>%
+  semi_join(test_sona, by = "ID") %>% 
+  select(-ID)
+
+#balance dataset 
+#test_tfidf <- downSample(x = test_tfidf[, -ncol(test_tfidf)],
+                        # y = test_tfidf$president_13, )
+#table(test_tfidf$president_13)
+
+test_tfidf_x <- test_tfidf %>% select(-president_13) 
+test_tfidf_y <- test_tfidf$president_13
+
+# bag of words train
+train_tfidf <- tfidf %>%
+  semi_join(train_sona, by = "ID") %>%
+  select(-ID)
+
+# balance dataset 
+train_tfidf <- downSample(x = train_tfidf[, -ncol(train_tfidf)],
+                         y = train_tfidf$president_13, )
+
+table(train_tfidf$president_13)
+
+train_tfidf_x <- train_tfidf %>% select(-president_13)
+#test_tfidf_x <- test_tfidf %>% select(-president_13)
+train_tfidf_y <- train_tfidf$president_13
+#test_tfidf_y <- test_tfidf_y$president_13
+train_tfidf_x <- as.matrix(train_tfidf_x)
+test_tfidf_x <- as.matrix(test_tfidf_x)
+
+class(train_tfidf_x)
+class(train_tfidf_y)
+
+```
+
+```{r}
+# tree model TRAIN
+tree_mod_tfidf <- rpart(president_13 ~., 
+                        data = train_tfidf, 
+                        method = "class",
+                        control = rpart.control(minsplit = 20, cp = 0.01))
+
+save(tree_mod_tfidf, file = "tree_mod_tfidf.RData")
+load("tree_mod_tfidf.RData")
+rpart.plot(tree_mod_tfidf)
+#cm
+
+
+tree_metric_tfidf <- round(sum(diag(predtrain_tfidf))/sum(predtrain_tfidf), 3)
+save(tree_metric_tfidf, file = "tree_metric_tfidf.RData")
+```
+
+```{r}
+# treeTEST
+fitted_test_tf <- predict(tree_mod_tfidf, 
+                          newdata = test_tfidf[,-1], type = "class")
+
+pred_test_tfidf <- table(test_tfidf$president_13, fitted_test_tf)
+
+tree_metric_tfidf_test <- round(sum(diag(pred_test_tfidf))/sum(pred_test_tfidf), 3)
+```
+
+```{r}
+# model 
+numerical_target_tfidf <- factor(train_tfidf_y)
+train_tfidf_y <- as.numeric(numerical_target_tfidf) -1
+train_tfidf_y <- to_categorical(train_tfidf_y, dtype = "float32")
+
+
+numerical_target_test_tfidf <- factor(test_tfidf_y)
+test_tfidf_y <- as.numeric(numerical_target_test_tfidf) -1
+unique(test_tfidf_y)
+test_tfidf_y <- to_categorical(test_tfidf_y, dtype = "float32")
+```
+
+```{r}
+# feed forward neural network
+model_ffnn_tfidf <- keras_model_sequential() %>%
+  layer_dense(units = 32, activation = "relu", input_shape = ncol(train_bow_x)) %>%
+  layer_dense(units = 32, activation = "relu", input_shape = ncol(train_bow_x), kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dense(units = 10, activation = "tanh") %>%
+  layer_dense(units = 15 , activation = "relu")%>%
+  layer_dense(units = 32 , activation = "relu")%>%
+  layer_dense(units = 32 , activation = "relu")%>%
+  layer_dense(units = 35, activation = "relu", input_shape = ncol(train_bow_x), kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dense(units = 4, activation = "softmax")
+summary(model_ffnn_tfidf )
+
+```
+
+```{r}
+# compile model
+model_ffnn_tfidf  %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  metrics = c("accuracy")
+)
+
+```
+
+```{r}
+# fit model
+nn_mod1_tfidf  <- model_ffnn_tfidf  %>% fit(train_tfidf_x, train_tfidf _y, epochs = 10, batch_size = 15, validation_split = 0.1)
+
+plot(nn_mod1)
+```
+
+```{r}
+results <- model_ffnn %>% evaluate(test_bow_x, test_bow_y, batch_size = 15, verbose=2)
+```
